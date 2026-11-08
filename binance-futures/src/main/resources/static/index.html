@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Background worker</title>
+  <style>
+    body { font: 16px system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; color: #172033; background: #f5f7fb; }
+    main { background: white; border-radius: 14px; padding: 2rem; box-shadow: 0 8px 30px #17203318; }
+    h1 { margin-top: 0; } .state { font-size: 1.4rem; font-weight: 700; }
+    .online { color: #16834b; } .offline { color: #b42318; }
+    button { border: 0; border-radius: 8px; padding: .7rem 1rem; margin: .25rem; cursor: pointer; color: white; background: #315efb; }
+    button.stop { background: #b42318; } button.restart { background: #687386; }
+    dl { display: grid; grid-template-columns: 10rem 1fr; gap: .7rem; } dt { color: #687386; } dd { margin: 0; }
+  </style>
+</head>
+<body><main>
+  <h1>Background worker</h1>
+  <p class="state" id="state">Loading…</p>
+  <dl><dt>Started</dt><dd id="started">—</dd><dt>Last work</dt><dd id="lastWork">—</dd><dt>Work cycles</dt><dd id="cycles">—</dd></dl>
+  <p><button onclick="control('start')">Start</button><button class="stop" onclick="control('stop')">Stop</button><button class="restart" onclick="control('restart')">Restart</button></p>
+</main><script>
+  const $ = id => document.getElementById(id);
+  const format = value => value ? new Date(value).toLocaleString() : '—';
+  async function refresh() { const s = await fetch('/status').then(r => r.json()); $('state').textContent = s.running ? 'Running' : 'Stopped'; $('state').className = 'state ' + (s.running ? 'online' : 'offline'); $('started').textContent = format(s.startedAt); $('lastWork').textContent = format(s.lastWorkAt); $('cycles').textContent = s.workCycles; }
+  async function control(action) { await fetch('/' + action, { method: 'POST' }); await refresh(); }
+  refresh(); setInterval(refresh, 2000);
+</script></body></html>

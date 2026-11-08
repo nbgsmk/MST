@@ -1,0 +1,6 @@
+spring:
+  application:
+    name: W
+
+server:
+  port: 8099
