@@ -3,37 +3,44 @@ package cc.kostic.mst;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.springframework.stereotype.Service;
-import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class WorkerService {
-	private static final URI BINANCE_STREAM = URI.create("wss://dstream.binance.com/ws/btcusd_perp@kline_1m");
+
+	private final BinanceProperties properties;
+	private final List<String> subscribedStreams = new CopyOnWriteArrayList<>();
 	private final ObjectMapper objectMapper = new ObjectMapper();
 	private final HttpClient httpClient = HttpClient.newHttpClient();
-	private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
-		Thread thread = new Thread(r, "binance-btcusd-worker");
-		thread.setDaemon(false);
+	private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(4, r -> {
+		Thread thread = new Thread(r, "binance-worker-pool");
+		thread.setDaemon(true);
 		return thread;
 	});
+
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicLong workCycles = new AtomicLong();
 	private final AtomicLong generation = new AtomicLong();
-	private volatile Future<?> worker;
-	private volatile WebSocket socket;
-	private volatile CompletableFuture<WebSocket> connectionAttempt;
-	private volatile boolean connected;
+
+	private final List<StreamSession> activeSessions = new CopyOnWriteArrayList<>();
 	private volatile String lastError;
 	private volatile Instant startedAt;
 	private volatile Instant lastWorkAt;
+
+	public WorkerService(BinanceProperties properties) {
+		this.properties = properties;
+	}
 
 	@PostConstruct
 	void initialize() {
@@ -48,36 +55,25 @@ public class WorkerService {
 		running.set(true);
 		startedAt = Instant.now();
 		lastError = null;
-		worker = executor.submit(new Runnable() {
-			@Override
-			public void run() {
-				WorkerService.this.streamForever(currentGeneration);
-			}
-		});
+		subscribedStreams.clear();
+		activeSessions.clear();
+
+		List<StreamSubscription> subscriptions = subscriptions();
+		for (StreamSubscription sub : subscriptions) {
+			StreamSession session = new StreamSession(sub, currentGeneration);
+			activeSessions.add(session);
+			executor.submit(session::run);
+		}
 	}
 
 	public synchronized void stop() {
 		generation.incrementAndGet();
 		running.set(false);
-		connected = false;
-		WebSocket currentSocket = socket;
-		if (currentSocket != null) {
-			try {
-				currentSocket.sendClose(WebSocket.NORMAL_CLOSURE, "worker stopped");
-			} catch (RuntimeException ignored) {
-				currentSocket.abort();
-			}
-			socket = null;
+		subscribedStreams.clear();
+		for (StreamSession session : activeSessions) {
+			session.close();
 		}
-		CompletableFuture<WebSocket> currentAttempt = connectionAttempt;
-		if (currentAttempt != null) {
-			currentAttempt.cancel(true);
-		}
-		Future<?> currentWorker = worker;
-		if (currentWorker != null) {
-			currentWorker.cancel(true);
-			worker = null;
-		}
+		activeSessions.clear();
 	}
 
 	public synchronized void restart() {
@@ -86,62 +82,113 @@ public class WorkerService {
 	}
 
 	public WorkerStatus status() {
-		return new WorkerStatus(running.get(), connected, startedAt, lastWorkAt, workCycles.get(), lastError);
+		boolean connected = running.get() && !activeSessions.isEmpty() && activeSessions.stream().anyMatch(StreamSession::isConnected);
+		return new WorkerStatus(
+				running.get(),
+				connected,
+				startedAt,
+				lastWorkAt,
+				workCycles.get(),
+				lastError,
+				new ArrayList<>(subscribedStreams)
+		);
 	}
 
-	private void streamForever(long currentGeneration) {
-		while (isCurrent(currentGeneration)) {
-			CountDownLatch connectionEnded = new CountDownLatch(1);
-			try {
-				CompletableFuture<WebSocket> attempt = httpClient.newWebSocketBuilder()
-						.buildAsync(BINANCE_STREAM, new BinanceListener(connectionEnded, currentGeneration));
-				connectionAttempt = attempt;
-				if (!isCurrent(currentGeneration)) {
-					attempt.cancel(true);
-					return;
-				}
-				WebSocket connectedSocket = attempt.join();
-				if (!isCurrent(currentGeneration)) {
-					connectedSocket.abort();
-					return;
-				}
-				socket = connectedSocket;
-				connectionEnded.await();
-			} catch (Exception exception) {
-				if (isCurrent(currentGeneration)) {
-					lastError = exception.getMessage();
-					System.err.println("Binance websocket connection failed: " + exception.getMessage());
-				}
-			} finally {
-				if (generation.get() == currentGeneration) {
-					connected = false;
-					socket = null;
-					connectionAttempt = null;
-				}
-			}
-			if (isCurrent(currentGeneration)) {
-				try {
-					Thread.sleep(2_000);
-				} catch (InterruptedException interrupted) {
-					Thread.currentThread().interrupt();
-					return;
-				}
-			}
-		}
+	public List<String> getSubscribedStreams() {
+		return new ArrayList<>(subscribedStreams);
 	}
 
 	private boolean isCurrent(long currentGeneration) {
 		return running.get() && generation.get() == currentGeneration;
 	}
 
-	private final class BinanceListener implements WebSocket.Listener {
+	private final class StreamSession {
+		private final StreamSubscription subscription;
+		private final long sessionGeneration;
+		private volatile WebSocket socket;
+		private volatile CompletableFuture<WebSocket> connectionAttempt;
+		private volatile boolean connected;
+
+		private StreamSession(StreamSubscription subscription, long sessionGeneration) {
+			this.subscription = subscription;
+			this.sessionGeneration = sessionGeneration;
+		}
+
+		boolean isConnected() {
+			return connected;
+		}
+
+		void close() {
+			connected = false;
+			subscribedStreams.remove(subscription.stream());
+			CompletableFuture<WebSocket> attempt = connectionAttempt;
+			if (attempt != null) {
+				attempt.cancel(true);
+			}
+			WebSocket ws = socket;
+			if (ws != null) {
+				try {
+					ws.sendClose(WebSocket.NORMAL_CLOSURE, "worker stopped");
+				} catch (RuntimeException ignored) {
+					ws.abort();
+				}
+				socket = null;
+			}
+		}
+
+		void run() {
+			while (isCurrent(sessionGeneration)) {
+				CountDownLatch connectionEnded = new CountDownLatch(1);
+				try {
+					CompletableFuture<WebSocket> attempt = httpClient.newWebSocketBuilder()
+							.buildAsync(URI.create(subscription.url()), new SingleStreamListener(this, connectionEnded, sessionGeneration, subscription));
+					connectionAttempt = attempt;
+					if (!isCurrent(sessionGeneration)) {
+						attempt.cancel(true);
+						return;
+					}
+					WebSocket connectedSocket = attempt.join();
+					if (!isCurrent(sessionGeneration)) {
+						connectedSocket.abort();
+						return;
+					}
+					socket = connectedSocket;
+					connectionEnded.await();
+				} catch (Exception exception) {
+					if (isCurrent(sessionGeneration)) {
+						lastError = exception.getMessage();
+						System.err.println("Binance websocket connection failed for " + subscription.stream() + ": " + exception.getMessage());
+					}
+				} finally {
+					connected = false;
+					subscribedStreams.remove(subscription.stream());
+					socket = null;
+					connectionAttempt = null;
+				}
+				if (isCurrent(sessionGeneration)) {
+					try {
+						Thread.sleep(2_000);
+					} catch (InterruptedException interrupted) {
+						Thread.currentThread().interrupt();
+						return;
+					}
+				}
+			}
+		}
+	}
+
+	private final class SingleStreamListener implements WebSocket.Listener {
+		private final StreamSession session;
 		private final CountDownLatch connectionEnded;
 		private final long listenerGeneration;
+		private final StreamSubscription subscription;
 		private final StringBuilder message = new StringBuilder();
 
-		private BinanceListener(CountDownLatch connectionEnded, long listenerGeneration) {
+		private SingleStreamListener(StreamSession session, CountDownLatch connectionEnded, long listenerGeneration, StreamSubscription subscription) {
+			this.session = session;
 			this.connectionEnded = connectionEnded;
 			this.listenerGeneration = listenerGeneration;
+			this.subscription = subscription;
 		}
 
 		@Override
@@ -151,9 +198,9 @@ public class WorkerService {
 				connectionEnded.countDown();
 				return;
 			}
-			connected = true;
+			session.connected = true;
 			lastError = null;
-			System.out.println("Connected to Binance Futures BTCUSD candle stream");
+			subscribe(webSocket, subscription);
 			WebSocket.Listener.super.onOpen(webSocket);
 		}
 
@@ -171,31 +218,69 @@ public class WorkerService {
 		public void onError(WebSocket webSocket, Throwable error) {
 			if (isCurrent(listenerGeneration)) {
 				lastError = error.getMessage();
+				session.connected = false;
+				subscribedStreams.remove(subscription.stream());
 			}
-			System.err.println("Binance websocket error: " + error.getMessage());
-			if (isCurrent(listenerGeneration)) {
-				connected = false;
-			}
+			System.err.println("Binance websocket error for " + subscription.stream() + ": " + error.getMessage());
 			connectionEnded.countDown();
 		}
 
 		@Override
 		public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
 			if (isCurrent(listenerGeneration)) {
-				connected = false;
+				session.connected = false;
+				subscribedStreams.remove(subscription.stream());
 			}
 			connectionEnded.countDown();
 			return WebSocket.Listener.super.onClose(webSocket, statusCode, reason);
 		}
 	}
 
+	private void subscribe(WebSocket webSocket, StreamSubscription subscription) {
+		String command = "{\"method\":\"SUBSCRIBE\",\"params\":[\""
+				+ subscription.stream() + "\"],\"id\":" + subscription.id() + "}";
+		webSocket.sendText(command, true);
+		if (!subscribedStreams.contains(subscription.stream())) {
+			subscribedStreams.add(subscription.stream());
+		}
+		System.out.println("Subscribed to " + subscription.url() + " (stream: " + subscription.stream() + ")");
+	}
+
+	private List<StreamSubscription> subscriptions() {
+		List<StreamSubscription> result = new ArrayList<>();
+		int id = 1;
+		if (properties.coinM() != null && properties.coinM().streams() != null) {
+			for (String stream : properties.coinM().streams()) {
+				result.add(new StreamSubscription(id++, stream, concatenate(properties.coinM().baseUrl(), stream)));
+			}
+		}
+		if (properties.perpetuals() != null && properties.perpetuals().streams() != null) {
+			for (String stream : properties.perpetuals().streams()) {
+				result.add(new StreamSubscription(id++, stream, concatenate(properties.perpetuals().baseUrl(), stream)));
+			}
+		}
+		return result;
+	}
+
+	private String concatenate(String baseUrl, String stream) {
+		return baseUrl.endsWith("/") || baseUrl.endsWith("=")
+				? baseUrl + stream
+				: baseUrl + "/" + stream;
+	}
+
 	private void printCandle(String message) {
 		try {
-			JsonNode candle = objectMapper.readTree(message).path("k");
+			JsonNode root = objectMapper.readTree(message);
+			JsonNode candle = root.path("k");
+			if (candle.isMissingNode() && root.hasNonNull("data")) {
+				candle = root.path("data").path("k");
+			}
 			if (candle.isMissingNode() || !candle.hasNonNull("t") || !candle.hasNonNull("c")) {
 				return;
 			}
-			System.out.printf("BTCUSD candle %s open=%s high=%s low=%s close=%s volume=%s closed=%s%n",
+			String symbol = candle.hasNonNull("s") ? candle.path("s").asText() : "BTCUSD";
+			System.out.printf("%s candle %s open=%s high=%s low=%s close=%s volume=%s closed=%s%n",
+					symbol,
 					Instant.ofEpochMilli(candle.path("t").asLong()), candle.path("o").asText(),
 					candle.path("h").asText(), candle.path("l").asText(), candle.path("c").asText(),
 					candle.path("v").asText(), candle.path("x").asBoolean());
@@ -217,7 +302,17 @@ public class WorkerService {
 		}
 	}
 
-	public record WorkerStatus(boolean running, boolean connected, Instant startedAt, Instant lastWorkAt,
-							   long workCycles, String lastError) {
+	public record WorkerStatus(
+			boolean running,
+			boolean connected,
+			Instant startedAt,
+			Instant lastWorkAt,
+			long workCycles,
+			String lastError,
+			List<String> subscribedStreams
+	) {
+	}
+
+	private record StreamSubscription(int id, String stream, String url) {
 	}
 }
