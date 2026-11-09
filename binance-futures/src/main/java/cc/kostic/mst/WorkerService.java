@@ -120,7 +120,9 @@ public class WorkerService {
 
 		void close() {
 			connected = false;
-			subscribedStreams.remove(subscription.stream());
+			for (String stream : subscription.streams()) {
+				subscribedStreams.remove(stream);
+			}
 			CompletableFuture<WebSocket> attempt = connectionAttempt;
 			if (attempt != null) {
 				attempt.cancel(true);
@@ -141,7 +143,7 @@ public class WorkerService {
 				CountDownLatch connectionEnded = new CountDownLatch(1);
 				try {
 					CompletableFuture<WebSocket> attempt = httpClient.newWebSocketBuilder()
-							.buildAsync(URI.create(subscription.url()), new SingleStreamListener(this, connectionEnded, sessionGeneration, subscription));
+							.buildAsync(URI.create(subscription.url()), new CommonStreamListener(this, connectionEnded, sessionGeneration, subscription));
 					connectionAttempt = attempt;
 					if (!isCurrent(sessionGeneration)) {
 						attempt.cancel(true);
@@ -157,11 +159,13 @@ public class WorkerService {
 				} catch (Exception exception) {
 					if (isCurrent(sessionGeneration)) {
 						lastError = exception.getMessage();
-						System.err.println("Binance websocket connection failed for " + subscription.stream() + ": " + exception.getMessage());
+						System.err.println("Binance websocket connection failed for " + subscription.streams() + ": " + exception.getMessage());
 					}
 				} finally {
 					connected = false;
-					subscribedStreams.remove(subscription.stream());
+					for (String stream : subscription.streams()) {
+						subscribedStreams.remove(stream);
+					}
 					socket = null;
 					connectionAttempt = null;
 				}
@@ -177,14 +181,14 @@ public class WorkerService {
 		}
 	}
 
-	private final class SingleStreamListener implements WebSocket.Listener {
+	private final class CommonStreamListener implements WebSocket.Listener {
 		private final StreamSession session;
 		private final CountDownLatch connectionEnded;
 		private final long listenerGeneration;
 		private final StreamSubscription subscription;
 		private final StringBuilder message = new StringBuilder();
 
-		private SingleStreamListener(StreamSession session, CountDownLatch connectionEnded, long listenerGeneration, StreamSubscription subscription) {
+		private CommonStreamListener(StreamSession session, CountDownLatch connectionEnded, long listenerGeneration, StreamSubscription subscription) {
 			this.session = session;
 			this.connectionEnded = connectionEnded;
 			this.listenerGeneration = listenerGeneration;
@@ -219,9 +223,11 @@ public class WorkerService {
 			if (isCurrent(listenerGeneration)) {
 				lastError = error.getMessage();
 				session.connected = false;
-				subscribedStreams.remove(subscription.stream());
+				for (String stream : subscription.streams()) {
+					subscribedStreams.remove(stream);
+				}
 			}
-			System.err.println("Binance websocket error for " + subscription.stream() + ": " + error.getMessage());
+			System.err.println("Binance websocket error for " + subscription.streams() + ": " + error.getMessage());
 			connectionEnded.countDown();
 		}
 
@@ -229,7 +235,9 @@ public class WorkerService {
 		public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
 			if (isCurrent(listenerGeneration)) {
 				session.connected = false;
-				subscribedStreams.remove(subscription.stream());
+				for (String stream : subscription.streams()) {
+					subscribedStreams.remove(stream);
+				}
 			}
 			connectionEnded.countDown();
 			return WebSocket.Listener.super.onClose(webSocket, statusCode, reason);
@@ -237,35 +245,47 @@ public class WorkerService {
 	}
 
 	private void subscribe(WebSocket webSocket, StreamSubscription subscription) {
-		String command = "{\"method\":\"SUBSCRIBE\",\"params\":[\""
-				+ subscription.stream() + "\"],\"id\":" + subscription.id() + "}";
+		String params = subscription.streams().stream()
+				.map(s -> "\"" + s + "\"")
+				.reduce((a, b) -> a + "," + b)
+				.orElse("");
+		String command = "{\"method\":\"SUBSCRIBE\",\"params\":[" + params + "],\"id\":" + subscription.id() + "}";
 		webSocket.sendText(command, true);
-		if (!subscribedStreams.contains(subscription.stream())) {
-			subscribedStreams.add(subscription.stream());
+		for (String stream : subscription.streams()) {
+			if (!subscribedStreams.contains(stream)) {
+				subscribedStreams.add(stream);
+			}
 		}
-		System.out.println("Subscribed to " + subscription.url() + " (stream: " + subscription.stream() + ")");
+		System.out.println("Subscribed to " + subscription.url() + " (streams: " + subscription.streams() + ")");
 	}
 
 	private List<StreamSubscription> subscriptions() {
 		List<StreamSubscription> result = new ArrayList<>();
 		int id = 1;
-		if (properties.coinM() != null && properties.coinM().streams() != null) {
-			for (String stream : properties.coinM().streams()) {
-				result.add(new StreamSubscription(id++, stream, concatenate(properties.coinM().baseUrl(), stream)));
-			}
+		if (properties.coinM() != null && properties.coinM().streams() != null && !properties.coinM().streams().isEmpty()) {
+			result.add(new StreamSubscription(id++, properties.coinM().streams(), resolveEndpointUrl(properties.coinM().baseUrl())));
 		}
-		if (properties.perpetuals() != null && properties.perpetuals().streams() != null) {
-			for (String stream : properties.perpetuals().streams()) {
-				result.add(new StreamSubscription(id++, stream, concatenate(properties.perpetuals().baseUrl(), stream)));
-			}
+		if (properties.perpetuals() != null && properties.perpetuals().streams() != null && !properties.perpetuals().streams().isEmpty()) {
+			result.add(new StreamSubscription(id++, properties.perpetuals().streams(), resolveEndpointUrl(properties.perpetuals().baseUrl())));
 		}
 		return result;
 	}
 
-	private String concatenate(String baseUrl, String stream) {
-		return baseUrl.endsWith("/") || baseUrl.endsWith("=")
-				? baseUrl + stream
-				: baseUrl + "/" + stream;
+	private String resolveEndpointUrl(String baseUrl) {
+		if (baseUrl == null || baseUrl.isBlank()) {
+			return "";
+		}
+		String url = baseUrl.trim();
+		if (url.contains("?")) {
+			url = url.substring(0, url.indexOf('?'));
+		}
+		while (url.endsWith("/")) {
+			url = url.substring(0, url.length() - 1);
+		}
+		if (url.endsWith("/market/stream")) {
+			url = url.substring(0, url.length() - "/market/stream".length()) + "/ws";
+		}
+		return url;
 	}
 
 	private void printCandle(String message) {
@@ -313,6 +333,6 @@ public class WorkerService {
 	) {
 	}
 
-	private record StreamSubscription(int id, String stream, String url) {
+	private record StreamSubscription(int id, List<String> streams, String url) {
 	}
 }

@@ -1,8 +1,19 @@
 spring:
   application:
     name: W
-  config:
-    import: classpath:default-config.yaml
 
 server:
   port: 8099
+
+binance:
+  coin-m:
+    baseUrl: "wss://fstream.binance.com/ws"
+    streams:
+      - "btcusdt@kline_1m"
+      - "ethusdt@kline_1m"
+
+  perpetuals:
+    baseUrl: "wss://dstream.binance.com/ws"
+    streams:
+      - "btcusd_perp@kline_1m"
+      - "ethusdt_perp@kline_1m"
