@@ -5,24 +5,65 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Background worker</title>
   <style>
-    body { font: 16px system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; color: #172033; background: #f5f7fb; }
-    main { background: white; border-radius: 14px; padding: 2rem; box-shadow: 0 8px 30px #17203318; }
-    h1 { margin-top: 0; } .state { font-size: 1.4rem; font-weight: 700; }
+    body { font: 16px system-ui, sans-serif; margin: 0; padding: 2rem 1rem; color: #172033; background: #f5f7fb; }
+    .container { display: flex; flex-wrap: wrap; gap: 1.5rem; max-width: 1040px; margin: 0 auto; align-items: flex-start; }
+    main, .status-panel { background: white; border-radius: 14px; padding: 2rem; box-shadow: 0 8px 30px #17203318; box-sizing: border-box; }
+    main { flex: 1 1 360px; min-width: 320px; }
+    .status-panel { flex: 1 1 360px; min-width: 320px; }
+    h1, h2 { margin-top: 0; }
+    h2 { font-size: 1.25rem; color: #334155; }
+    .state { font-size: 1.4rem; font-weight: 700; }
     .online { color: #16834b; } .offline { color: #b42318; }
-    button { border: 0; border-radius: 8px; padding: .7rem 1rem; margin: .25rem; cursor: pointer; color: white; background: #315efb; }
-    button.stop { background: #b42318; } button.restart { background: #687386; }
+    button { border: 0; border-radius: 8px; padding: .7rem 1rem; margin: .25rem; cursor: pointer; color: white; background: #315efb; font-size: 0.95rem; }
+    button.stop { background: #b42318; } button.restart { background: #687386; } button.status { background: #0f766e; }
     dl { display: grid; grid-template-columns: 10rem 1fr; gap: .7rem; } dt { color: #687386; } dd { margin: 0; }
+    pre { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1rem; font-size: 0.85rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; overflow-x: auto; color: #1e293b; margin: 0; line-height: 1.4; }
   </style>
 </head>
-<body><main>
-  <h1>Background worker</h1>
-  <p class="state" id="state">Loading…</p>
-  <dl><dt>Started</dt><dd id="started">—</dd><dt>Last work</dt><dd id="lastWork">—</dd><dt>Work cycles</dt><dd id="cycles">—</dd></dl>
-  <p><button onclick="control('start')">Start</button><button class="stop" onclick="control('stop')">Stop</button><button class="restart" onclick="control('restart')">Restart</button></p>
-</main><script>
+<body>
+<div class="container">
+  <main>
+    <h1>Background worker</h1>
+    <p class="state" id="state">Loading…</p>
+    <dl><dt>Started</dt><dd id="started">—</dd><dt>Last work</dt><dd id="lastWork">—</dd><dt>Work cycles</dt><dd id="cycles">—</dd></dl>
+    <p><button class="status" onclick="refresh()">Status</button><button onclick="control('start')">Start</button><button class="stop" onclick="control('stop')">Stop</button><button class="restart" onclick="control('restart')">Restart</button></p>
+  </main>
+  <aside class="status-panel">
+    <h2>Status Details</h2>
+    <pre id="statusResult">Loading…</pre>
+  </aside>
+</div>
+<script>
   const $ = id => document.getElementById(id);
   const format = value => value ? new Date(value).toLocaleString() : '—';
-  async function refresh() { const s = await fetch('/status').then(r => r.json()); $('state').textContent = s.running ? 'Running' : 'Stopped'; $('state').className = 'state ' + (s.running ? 'online' : 'offline'); $('started').textContent = format(s.startedAt); $('lastWork').textContent = format(s.lastWorkAt); $('cycles').textContent = s.workCycles; }
-  async function control(action) { await fetch('/' + action, { method: 'POST' }); await refresh(); }
-  refresh(); setInterval(refresh, 2000);
-</script></body></html>
+  async function refresh() {
+    try {
+      const s = await fetch('/status').then(r => r.json());
+      $('state').textContent = s.running ? 'Running' : 'Stopped';
+      $('state').className = 'state ' + (s.running ? 'online' : 'offline');
+      $('started').textContent = format(s.startedAt);
+      $('lastWork').textContent = format(s.lastWorkAt);
+      $('cycles').textContent = s.workCycles;
+      $('statusResult').textContent = JSON.stringify(s, null, 2);
+    } catch (e) {
+      $('statusResult').textContent = 'Error fetching status: ' + e.message;
+    }
+  }
+  async function control(action) {
+    try {
+      const s = await fetch('/' + action, { method: 'POST' }).then(r => r.json());
+      $('state').textContent = s.running ? 'Running' : 'Stopped';
+      $('state').className = 'state ' + (s.running ? 'online' : 'offline');
+      $('started').textContent = format(s.startedAt);
+      $('lastWork').textContent = format(s.lastWorkAt);
+      $('cycles').textContent = s.workCycles;
+      $('statusResult').textContent = JSON.stringify(s, null, 2);
+    } catch (e) {
+      await refresh();
+    }
+  }
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>
